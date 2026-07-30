@@ -162,6 +162,8 @@ if (Vulkan_FOUND)
         message(STATUS "vulkan-shaders-gen toolchain file: ${HOST_CMAKE_TOOLCHAIN_FILE}")
     endif()
 
+    set (_ggml_vk_host_suffix $<IF:$<STREQUAL:${CMAKE_HOST_SYSTEM_NAME},Windows>,.exe,>)
+
     ExternalProject_Add(
         vulkan-shaders-gen
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders
@@ -171,18 +173,40 @@ if (Vulkan_FOUND)
                    ${VULKAN_SHADER_GEN_CMAKE_ARGS}
 
         BUILD_COMMAND ${CMAKE_COMMAND} --build . --config $<CONFIG>
-        BUILD_ALWAYS  TRUE
+        # Polaris patch (2026-07-29): BUILD_ALWAYS TRUE re-ran the build and
+        # install steps on EVERY pass, updating this target's step stamps.
+        # The shader-generation custom commands below DEPEND on this target,
+        # so every stamp update marked every shader .cpp out of date - an
+        # UNCHANGED build regenerated all shaders, recompiled ggml-vulkan and
+        # relinked every consumer (~4-5 minutes of no-op work). The generator
+        # now rebuilds ON DEMAND: ExternalProject_Add_StepDependencies (below,
+        # after the source glob) re-runs the build step when any generator
+        # source changes, so a genuine change still cascades correctly.
+        BUILD_ALWAYS  FALSE
 
         # NOTE: When DESTDIR is set using Makefile generators and
         # "make install" triggers the build step, vulkan-shaders-gen
         # would be installed into the DESTDIR prefix, so it is unset
         # to ensure that does not happen.
 
+        # Polaris patch (2026-07-29): BUILD_ALWAYS re-runs this install step on
+        # EVERY build pass, and `cmake --install` unconditionally rewrites the
+        # installed vulkan-shaders-gen executable's timestamp. That timestamp
+        # is an implicit input of every shader-generation custom command below,
+        # so an UNCHANGED build regenerated every shader .cpp, recompiled
+        # ggml-vulkan and relinked every consumer (~5 minutes of no-op work).
+        # Install into a private stage prefix (always rewritten, harmless) and
+        # only copy the tool into its consumed location when its BYTES changed:
+        # a genuine tool/source change still cascades into shader regeneration,
+        # an unchanged build no longer relinks anything.
         INSTALL_COMMAND ${CMAKE_COMMAND} -E env --unset=DESTDIR
                         ${CMAKE_COMMAND} --install . --config $<CONFIG>
+                        --prefix <BINARY_DIR>/polaris-install-stage
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        <BINARY_DIR>/polaris-install-stage/vulkan-shaders-gen${_ggml_vk_host_suffix}
+                        ${CMAKE_BINARY_DIR}/$<CONFIG>/vulkan-shaders-gen${_ggml_vk_host_suffix}
     )
 
-    set (_ggml_vk_host_suffix $<IF:$<STREQUAL:${CMAKE_HOST_SYSTEM_NAME},Windows>,.exe,>)
     set (_ggml_vk_genshaders_dir "${CMAKE_BINARY_DIR}/$<CONFIG>")
     set (_ggml_vk_genshaders_cmd "${_ggml_vk_genshaders_dir}/vulkan-shaders-gen${_ggml_vk_host_suffix}")
     set (_ggml_vk_header     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
@@ -199,6 +223,11 @@ if (Vulkan_FOUND)
               CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
                                 "${_ggml_vk_input_dir}/*.h")
 
+    # Polaris patch (2026-07-29): with BUILD_ALWAYS FALSE the generator only
+    # rebuilds when one of its own sources changes (file-level step deps).
+    ExternalProject_Add_StepDependencies(vulkan-shaders-gen build
+                                         ${_ggml_vk_shaders_gen_sources})
+
     add_custom_command(
         OUTPUT ${_ggml_vk_header}
         COMMAND ${_ggml_vk_genshaders_cmd}
@@ -210,13 +239,25 @@ if (Vulkan_FOUND)
     )
     target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header})
 
+    # Polaris patch (2026-07-29): NO DEPFILE. vulkan-shaders-gen writes
+    # Makefile-style .d files with UNESCAPED SPACES in the paths; on a source
+    # checkout whose path contains a space ("F:/Software Development/...") the
+    # depfile transform parses bogus, nonexistent inputs and marks every
+    # shader rule permanently out of date - all 132 shaders regenerated on
+    # EVERY build pass, recompiling ggml-vulkan and relinking every consumer
+    # (~4-5 minutes of no-op work per unchanged build). The .glsl includes the
+    # depfiles were tracking are declared as explicit DEPENDS instead: any
+    # include change regenerates all shaders (coarse but correct), and an
+    # unchanged build regenerates nothing.
+    file(GLOB _ggml_vk_shader_includes
+              CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.glsl")
+
     foreach (file_full ${_ggml_vk_shader_files})
         get_filename_component(file ${file_full} NAME)
         set (_ggml_vk_target_cpp "${CMAKE_CURRENT_BINARY_DIR}/${file}.cpp")
 
         add_custom_command(
             OUTPUT  ${_ggml_vk_target_cpp}
-            DEPFILE ${_ggml_vk_target_cpp}.d
             COMMAND ${_ggml_vk_genshaders_cmd}
                 --glslc      ${Vulkan_GLSLC_EXECUTABLE}
                 --source     ${file_full}
@@ -224,6 +265,7 @@ if (Vulkan_FOUND)
                 --target-hpp ${_ggml_vk_header}
                 --target-cpp ${_ggml_vk_target_cpp}
             DEPENDS ${file_full}
+                    ${_ggml_vk_shader_includes}
                     ${_ggml_vk_shaders_gen_sources}
                     vulkan-shaders-gen
             COMMENT "Generate vulkan shaders for ${file}"
