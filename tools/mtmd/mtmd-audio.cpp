@@ -14,6 +14,29 @@
 
 constexpr bool DEBUG = false;
 
+// ── Polaris extension: cancellable audio preprocessing ──────────────────────
+// Process-global abort hook consulted by the shared mel kernel below (every
+// worker thread, bounded frame cadence). Two relaxed atomics; the embedding
+// app installs the pair before any preprocessing and keeps user_data valid
+// while installed. The callback must be cheap and thread-safe.
+#include <atomic>
+namespace {
+    std::atomic<bool (*)(void *)> g_audio_abort_cb { nullptr };
+    std::atomic<void *>           g_audio_abort_ud { nullptr };
+
+    inline bool audio_abort_requested() {
+        if (auto * cb = g_audio_abort_cb.load(std::memory_order_acquire)) {
+            return cb(g_audio_abort_ud.load(std::memory_order_acquire));
+        }
+        return false;
+    }
+}
+
+void mtmd_audio_set_abort_callback(bool (*abort_cb)(void * user_data), void * user_data) {
+    g_audio_abort_ud.store(user_data, std::memory_order_release);
+    g_audio_abort_cb.store(abort_cb,  std::memory_order_release);
+}
+
 void mtmd_audio_cache::fill_sin_cos_table(uint32_t n) {
     sin_vals.resize(n);
     cos_vals.resize(n);
@@ -307,7 +330,14 @@ static void log_mel_spectrogram_worker_thread(int                        ith,
     GGML_ASSERT(n_fft_bins == 1 + (frame_size / 2));
     GGML_ASSERT(cache.sin_vals.size() == cache.cos_vals.size());
     // calculate FFT only when fft_in are not all zero
+    int rows_done = 0;
     for (; i < std::min((int64_t)(n_samples / frame_step + 1), out.n_len); i += n_threads) {
+        // Polaris extension: bounded-cadence abort check — a pending abort
+        // stops this worker within a handful of frame rows; the caller
+        // (log_mel_spectrogram) turns the abort into a false return.
+        if ((rows_done++ & 7) == 0 && audio_abort_requested()) {
+            return;
+        }
         const int64_t offset = i * frame_step;
 
         // apply Hann window (~10% faster)
@@ -364,6 +394,37 @@ static void log_mel_spectrogram_worker_thread(int                        ith,
     }
 }
 
+// Polaris extension: drive the REAL shared kernel with whisper-shaped
+// parameters and a self-built cache, so an integration test can prove the
+// abort hook on the actual preprocessing path without a model file.
+static bool log_mel_spectrogram(
+        const float * samples, const int n_samples_in, const int n_threads,
+        const struct filter_params & params, const mtmd_audio_cache & cache,
+        mtmd_audio_mel & out);
+
+bool mtmd_audio_log_mel_for_tests(const float * samples, int n_samples,
+                                  int n_threads, int64_t n_mel, int n_fft,
+                                  int hop_length, int sample_rate,
+                                  mtmd_audio_mel & out) {
+    mtmd_audio_cache cache;
+    cache.fill_sin_cos_table(n_fft);
+    cache.fill_hann_window(n_fft, true);
+    cache.fill_mel_filterbank_matrix(n_mel, n_fft, sample_rate);
+
+    filter_params params;
+    params.n_mel            = n_mel;
+    params.n_fft_bins       = 1 + (n_fft / 2);
+    params.hann_window_size = n_fft;
+    params.hop_length       = hop_length;
+    params.sample_rate      = sample_rate;
+    params.center_padding   = false;
+    params.preemph          = 0.0f;
+    params.use_natural_log  = false;
+    params.norm_per_feature = false;
+
+    return log_mel_spectrogram(samples, n_samples, n_threads, params, cache, out);
+}
+
 // ref: https://github.com/openai/whisper/blob/main/whisper/audio.py#L110-L157
 static bool log_mel_spectrogram(
         const float * samples,
@@ -376,6 +437,11 @@ static bool log_mel_spectrogram(
 
     out.n_len_org = n_samples_in;
     int n_samples = n_samples_in;
+
+    // Polaris extension: an abort pending before any work starts.
+    if (audio_abort_requested()) {
+        return false;
+    }
 
     // Hann window
     const float * hann       = cache.hann_window.data();
@@ -473,6 +539,12 @@ static bool log_mel_spectrogram(
         for (int iw = 0; iw < n_threads - 1; ++iw) {
             workers[iw].join();
         }
+    }
+
+    // Polaris extension: an abort observed by any worker leaves a partial
+    // spectrogram — report failure so no truncated mel reaches the model.
+    if (audio_abort_requested()) {
+        return false;
     }
 
     const int64_t effective_n_len = n_samples_in / frame_step;

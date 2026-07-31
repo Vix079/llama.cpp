@@ -9,6 +9,28 @@
 
 #define MTMD_INTERNAL_HEADER
 
+// ── Polaris extension: cancellable audio preprocessing ──────────────────────
+// The mel-spectrogram preprocessing (log_mel_spectrogram in mtmd-audio.cpp)
+// is pure CPU work with no ggml graph, so neither llama_set_abort_callback
+// nor the scheduler eval callback can interrupt it. This minimal global
+// hook lets the embedding app abort it between frame rows: the callback
+// (checked by every worker thread of the shared kernel at a bounded frame
+// cadence) returning true makes log_mel_spectrogram — and therefore every
+// preprocessor's preprocess() built on it — return false promptly.
+// abort_cb must be thread-safe and cheap (an atomic flag read). Passing
+// nullptr uninstalls it. user_data must stay valid while installed.
+void mtmd_audio_set_abort_callback(bool (*abort_cb)(void * user_data), void * user_data);
+
+struct mtmd_audio_mel;
+
+// Polaris extension: drive the REAL shared mel kernel (whisper-shaped
+// parameters, own cache) so an integration test can prove the abort hook on
+// the actual preprocessing path without a model file. Not public mtmd API.
+bool mtmd_audio_log_mel_for_tests(const float * samples, int n_samples,
+                                  int n_threads, int64_t n_mel, int n_fft,
+                                  int hop_length, int sample_rate,
+                                  mtmd_audio_mel & out);
+
 struct mtmd_audio_mel {
     int64_t n_len;
     int64_t n_len_org;
