@@ -1706,7 +1706,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
-                    break;
+                    // Polaris fix: honour the documented contract ("if the
+                    // user returns false, the scheduler will cancel the graph
+                    // compute") with a TYPED abort. The old `break` skipped
+                    // the rest of this split, CONTINUED with the remaining
+                    // splits and returned GGML_STATUS_SUCCESS - so a caller
+                    // (clip_image_batch_encode) treated the INCOMPLETE output
+                    // tensor as a successful embedding and handed it to the
+                    // language-model decoder.
+                    return GGML_STATUS_ABORTED;
                 }
 
                 j0 = j1;
